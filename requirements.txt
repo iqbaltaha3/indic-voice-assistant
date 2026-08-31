@@ -1,0 +1,6 @@
+numpy
+sounddevice
+sarvamai
+groq
+python-dotenv
+rank_bm25
