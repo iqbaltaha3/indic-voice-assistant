@@ -3,4 +3,8 @@ sounddevice
 sarvamai
 groq
 python-dotenv
-rank_bm25
+numpy
+sounddevice
+sarvamai
+groq
+python-dotenv
