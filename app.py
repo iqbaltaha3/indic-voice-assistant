@@ -1,14 +1,8 @@
 import os
-import io
-import sys
 import time
-import wave
-import subprocess
-import traceback
 from collections import deque
 
-import numpy as np
-import sounddevice as sd
+import streamlit as st
 from dotenv import load_dotenv
 
 from sarvamai import SarvamAI
@@ -20,10 +14,10 @@ from groq import Groq
 # CONFIGURATION
 # ===============================================================
 
-load_dotenv()  # reads a .env file in the current directory, if present
+load_dotenv()  # reads a .env file locally; on Streamlit Cloud, use st.secrets instead
 
-SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY") or st.secrets.get("SARVAM_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
 
 STT_MODEL = "saaras:v3"          # auto-detects language
 TTS_MODEL = "bulbul:v3"
@@ -33,15 +27,12 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 # Short-term memory: how many of the assistant's own past responses get
 # fed back into the system prompt on the next turn.
 MEMORY_SIZE = 5
-response_history = deque(maxlen=MEMORY_SIZE)
-
-SAMPLE_RATE = 16000
 
 TTS_OUTPUT_FILE = "response.wav"
 
 # Sarvam language codes -> display names.
-# Only used for logging; STT auto-detects, so this isn't a fixed list
-# we classify into anymore -- Sarvam covers all 22 scheduled languages.
+# Only used for display; STT auto-detects, so this isn't a fixed list
+# we classify into -- Sarvam covers all 22 scheduled languages.
 LANGUAGE_NAMES = {
     "hi-IN": "Hindi",
     "bn-IN": "Bengali",
@@ -54,11 +45,6 @@ LANGUAGE_NAMES = {
 
 # Sarvam bulbul:v3 speakers -- pick one per language if you want a
 # consistent voice per language, or just use one speaker for all.
-# Valid bulbul:v3 speakers (per Sarvam API): aditya, ritu, ashutosh, priya,
-# neha, rahul, pooja, rohan, simran, kavya, amit, dev, ishita, shreya, ratan,
-# varun, manan, sumit, roopa, kabir, aayan, shubh, advait, anand, tanya,
-# tarun, sunny, mani, gokul, vijay, shruti, suhani, mohit, kavitha, rehan,
-# soham, rupali, niharika
 TTS_SPEAKERS = {
     "hi-IN": "priya",
     "bn-IN": "priya",
@@ -72,146 +58,41 @@ DEFAULT_SPEAKER = "priya"
 
 
 # ===============================================================
-# CLIENTS
+# CLIENTS (cached so we don't reconnect on every Streamlit rerun)
 # ===============================================================
 
-sarvam_client = None
-groq_client = None
-
-
-def init_clients():
-
-    global sarvam_client, groq_client
+@st.cache_resource
+def get_clients():
 
     if not SARVAM_API_KEY:
         raise RuntimeError(
-            "SARVAM_API_KEY environment variable is not set."
+            "SARVAM_API_KEY is not set. Add it in Streamlit Cloud under "
+            "Settings -> Secrets, or in a local .env file."
         )
 
     if not GROQ_API_KEY:
         raise RuntimeError(
-            "GROQ_API_KEY environment variable is not set."
+            "GROQ_API_KEY is not set. Add it in Streamlit Cloud under "
+            "Settings -> Secrets, or in a local .env file."
         )
 
     sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
     groq_client = Groq(api_key=GROQ_API_KEY)
 
-
-# ===============================================================
-# UTILITIES
-# ===============================================================
-
-def section(title):
-    print()
-    print("=" * 70)
-    print(title)
-    print("=" * 70)
-
-
-def safe_float32(audio):
-    audio = np.asarray(audio)
-    if audio.dtype != np.float32:
-        audio = audio.astype(np.float32)
-    return audio
-
-
-# ===============================================================
-# MICROPHONE
-# ===============================================================
-
-def record_audio():
-
-    section("STEP 1 — MICROPHONE")
-
-    print()
-    print("Press ENTER when ready...")
-    input()
-
-    print()
-    print("🎙️  RECORDING")
-    print()
-    print("Speak naturally.")
-    print("Press Ctrl+C to stop recording.")
-    print()
-
-    chunks = []
-
-    def callback(indata, frames, time_info, status):
-        if status:
-            print("Audio status:", status)
-        chunks.append(indata.copy())
-
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=callback,
-    )
-
-    stream.start()
-
-    try:
-        while True:
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print()
-        print("Recording stopped.")
-
-    finally:
-        stream.stop()
-        stream.close()
-
-    if not chunks:
-        raise RuntimeError("No audio was recorded.")
-
-    audio = np.concatenate(chunks, axis=0)
-    audio = audio[:, 0]
-    audio = safe_float32(audio)
-    audio = np.clip(audio, -1.0, 1.0)
-
-    duration = len(audio) / SAMPLE_RATE
-
-    audio_int16 = (audio * 32767).astype(np.int16)
-
-    # Build the WAV entirely in memory -- no file written to disk.
-    buffer = io.BytesIO()
-
-    with wave.open(buffer, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_int16.tobytes())
-
-    buffer.seek(0)
-
-    print()
-    print("Recording complete.")
-    print()
-    print(f"Duration:       {duration:.2f}s")
-    print(f"Samples:        {len(audio):,}")
-
-    return buffer
+    return sarvam_client, groq_client
 
 
 # ===============================================================
 # SARVAM — SPEECH TO TEXT (auto language detection + transcription
-# in a single API call; replaces the local Whisper classifier and
-# IndicConformer entirely)
+# in a single API call)
 # ===============================================================
 
-def transcribe(audio_buffer):
-
-    section("STEP 2 — SARVAM SPEECH-TO-TEXT")
-
-    print()
-    print(f"Model: {STT_MODEL}")
-    print("Sending audio to Sarvam AI...")
+def transcribe(sarvam_client, audio_bytes):
 
     start = time.time()
 
     response = sarvam_client.speech_to_text.transcribe(
-        file=("input.wav", audio_buffer, "audio/wav"),
+        file=("input.wav", audio_bytes, "audio/wav"),
         model=STT_MODEL,
         language_code="unknown",  # auto-detect
     )
@@ -224,32 +105,16 @@ def transcribe(audio_buffer):
     if not transcript:
         raise RuntimeError("Sarvam STT returned an empty transcript.")
 
-    language_name = LANGUAGE_NAMES.get(language_code, language_code)
-
-    print()
-    print(f"STT time: {elapsed:.2f}s")
-    print(f"Detected language: {language_name} ({language_code})")
-    print()
-    print("TRANSCRIPT:")
-    print()
-    print(transcript)
-
-    return transcript, language_code
+    return transcript, language_code, elapsed
 
 
 # ===============================================================
 # GROQ — LLM
 # ===============================================================
 
-def ask_groq(transcript, language_code):
-
-    section("STEP 3 — GROQ LLM")
+def ask_groq(groq_client, transcript, language_code, response_history):
 
     language_name = LANGUAGE_NAMES.get(language_code, language_code)
-
-    print()
-    print(f"Model: {GROQ_MODEL}")
-    print("Sending transcript to Groq...")
 
     system_prompt = (
         f"You are a helpful voice assistant. The user is speaking in "
@@ -293,35 +158,16 @@ def ask_groq(transcript, language_code):
     if not response:
         raise RuntimeError("Groq returned an empty response.")
 
-    response_history.append(response)
-
-    print()
-    print(f"LLM time: {elapsed:.2f}s")
-    print(f"Memory:   {len(response_history)}/{MEMORY_SIZE} past responses in context")
-    print()
-    print("LLM RESPONSE:")
-    print()
-    print(response)
-
-    return response
+    return response, elapsed
 
 
 # ===============================================================
 # SARVAM — TEXT TO SPEECH
 # ===============================================================
 
-def generate_tts(text, language_code):
-
-    section("STEP 4 — SARVAM TEXT-TO-SPEECH")
+def generate_tts(sarvam_client, text, language_code):
 
     speaker = TTS_SPEAKERS.get(language_code, DEFAULT_SPEAKER)
-
-    print()
-    print(f"Model:    {TTS_MODEL}")
-    print(f"Language: {LANGUAGE_NAMES.get(language_code, language_code)}")
-    print(f"Speaker:  {speaker}")
-    print()
-    print("Generating speech...")
 
     start = time.time()
 
@@ -336,124 +182,134 @@ def generate_tts(text, language_code):
 
     save_tts_audio(audio_response, TTS_OUTPUT_FILE)
 
-    print()
-    print(f"TTS time: {elapsed:.2f}s")
-    print(f"Saved: {os.path.abspath(TTS_OUTPUT_FILE)}")
-
-    return TTS_OUTPUT_FILE
+    return TTS_OUTPUT_FILE, speaker, elapsed
 
 
 # ===============================================================
-# PLAY AUDIO
-# ===============================================================
-
-def play_audio(filename):
-
-    section("STEP 5 — SPEAKER")
-
-    print()
-    print(f"Playing: {filename}")
-
-    try:
-        subprocess.run(["afplay", filename], check=True)
-
-    except FileNotFoundError:
-        print("afplay not found.")
-        print("Audio file is available at:")
-        print(os.path.abspath(filename))
-
-
-# ===============================================================
-# MAIN PIPELINE
+# STREAMLIT APP
 # ===============================================================
 
 def main():
 
-    section("INDIC MULTILINGUAL ONLINE VOICE AI")
+    st.set_page_config(page_title="Indic Voice Assistant", page_icon="🎙️")
 
-    print()
-    print("Architecture:")
-    print()
-    print(
-        """
-  Microphone
-      ↓
-  WAV
-      ↓
-  Sarvam STT (saaras:v3) — auto language detection + transcription
-      ↓
-  Groq LLM (openai/gpt-oss-20b)
-      ↓
-  Sarvam TTS (bulbul:v3)
-      ↓
-  Speaker
-"""
+    st.title("🎙️ Indic Voice Assistant")
+    st.caption(
+        "Speak in any of the 22 scheduled Indian languages. The assistant "
+        "detects the language, replies in it, and speaks the reply back."
     )
 
-    print(f"STT:  {STT_MODEL} (Sarvam AI)")
-    print(f"LLM:  {GROQ_MODEL} (Groq)")
-    print(f"TTS:  {TTS_MODEL} (Sarvam AI)")
+    if "response_history" not in st.session_state:
+        st.session_state.response_history = deque(maxlen=MEMORY_SIZE)
+
+    if "turn_log" not in st.session_state:
+        st.session_state.turn_log = []
 
     try:
-        init_clients()
+        sarvam_client, groq_client = get_clients()
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
 
-        turn = 1
+    st.subheader("Architecture")
+    st.code(
+        "Browser mic\n"
+        "    ↓\n"
+        "Sarvam STT (saaras:v3) — auto language detection + transcription\n"
+        "    ↓\n"
+        "Groq LLM (openai/gpt-oss-20b)\n"
+        "    ↓\n"
+        "Sarvam TTS (bulbul:v3)\n"
+        "    ↓\n"
+        "Browser speaker",
+        language=None,
+    )
 
-        while True:
+    st.subheader("Speak")
+    audio_value = st.audio_input("Record your question")
 
-            section(f"TURN {turn}")
+    if audio_value is not None:
 
-            audio_buffer = record_audio()
+        if st.button("Process this recording", type="primary"):
 
-            transcript, language_code = transcribe(audio_buffer)
+            with st.status("Running the pipeline...", expanded=True) as status:
 
-            llm_response = ask_groq(transcript, language_code)
+                try:
+                    status.write("Transcribing with Sarvam STT...")
+                    transcript, language_code, stt_time = transcribe(
+                        sarvam_client, audio_value.getvalue()
+                    )
+                    language_name = LANGUAGE_NAMES.get(language_code, language_code)
+                    status.write(
+                        f"Detected language: {language_name} ({language_code}) "
+                        f"in {stt_time:.2f}s"
+                    )
 
-            tts_file = generate_tts(llm_response, language_code)
+                    status.write("Asking Groq LLM...")
+                    llm_response, llm_time = ask_groq(
+                        groq_client,
+                        transcript,
+                        language_code,
+                        st.session_state.response_history,
+                    )
+                    st.session_state.response_history.append(llm_response)
+                    status.write(f"LLM responded in {llm_time:.2f}s")
 
-            play_audio(tts_file)
+                    status.write("Generating speech with Sarvam TTS...")
+                    tts_file, speaker, tts_time = generate_tts(
+                        sarvam_client, llm_response, language_code
+                    )
+                    status.write(f"TTS ({speaker}) generated in {tts_time:.2f}s")
 
-            section("TURN COMPLETE")
+                    with open(tts_file, "rb") as f:
+                        tts_bytes = f.read()
 
-            print()
-            print(f"Language:    {LANGUAGE_NAMES.get(language_code, language_code)}")
-            print(f"Code:        {language_code}")
-            print()
-            print("Transcript:")
-            print(transcript)
-            print()
-            print("LLM response:")
-            print(llm_response)
-            print()
-            print("TTS:")
-            print(os.path.abspath(tts_file))
+                    st.session_state.turn_log.insert(
+                        0,
+                        {
+                            "language_name": language_name,
+                            "language_code": language_code,
+                            "transcript": transcript,
+                            "response": llm_response,
+                            "audio": tts_bytes,
+                        },
+                    )
 
-            print()
-            choice = input(
-                "Press ENTER for another turn, or type 'q' then ENTER to quit: "
-            ).strip().lower()
+                    status.update(label="Done", state="complete")
 
-            if choice == "q":
-                print()
-                print("Session ended.")
-                break
+                except Exception as e:
+                    status.update(label="Failed", state="error")
+                    st.exception(e)
 
-            turn += 1
+    if st.session_state.turn_log:
 
-    except KeyboardInterrupt:
-        print()
-        print("Pipeline interrupted.")
-        sys.exit(1)
+        st.subheader("Conversation")
 
-    except Exception as e:
-        section("ERROR")
-        print()
-        print(type(e).__name__)
-        print()
-        print(str(e))
-        print()
-        traceback.print_exc()
-        sys.exit(1)
+        for i, turn in enumerate(st.session_state.turn_log):
+
+            n = len(st.session_state.turn_log) - i
+
+            with st.container(border=True):
+                st.markdown(
+                    f"**Turn {n} — {turn['language_name']} ({turn['language_code']})**"
+                )
+                st.markdown(f"**You said:** {turn['transcript']}")
+                st.markdown(f"**Assistant:** {turn['response']}")
+                st.audio(turn["audio"], format="audio/wav")
+
+    with st.sidebar:
+        st.header("Settings")
+        st.write(f"STT: `{STT_MODEL}` (Sarvam AI)")
+        st.write(f"LLM: `{GROQ_MODEL}` (Groq)")
+        st.write(f"TTS: `{TTS_MODEL}` (Sarvam AI)")
+        st.write(
+            f"Memory: {len(st.session_state.response_history)}/{MEMORY_SIZE} "
+            "past responses in context"
+        )
+        if st.button("Clear conversation"):
+            st.session_state.response_history.clear()
+            st.session_state.turn_log = []
+            st.rerun()
 
 
 if __name__ == "__main__":
