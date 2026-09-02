@@ -63,13 +63,6 @@ transcribes, thinks, and speaks back before prompting for the next turn.
    GROQ_API_KEY=your_groq_key_here
    ```
 
-   > ⚠️ **Security note:** this repository currently has a `.env` file
-   > committed with live-looking API keys. `.env` is listed in
-   > `.gitignore` going forward, but since it's already been committed to
-   > git history, treat those keys as compromised — rotate/revoke them
-   > with Sarvam and Groq and remove the file from git history before
-   > pushing this repo anywhere public.
-
 3. **Run the assistant**
 
    ```bash
